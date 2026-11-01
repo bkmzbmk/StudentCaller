@@ -1,2 +1,5 @@
 openpyxl>=3.1
 pyttsx3>=2.90
+# Silero TTS (нейросетевая русская озвучка). Без них используются голоса Windows.
+numpy>=1.23      # optional
+torch>=2.0       # optional

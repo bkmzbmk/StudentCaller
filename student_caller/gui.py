@@ -18,16 +18,19 @@ from .config import (
     DEFAULT_ROSTER,
     LOG_FILE,
     MAX_CALL_COUNT,
+    MODELS_DIR,
     RESULTS_DIR,
 )
 from .exporter import default_filename, export_lesson
 from .models import Lesson, NoStudentsError
 from .roster import load_roster
 from .settings import load_settings, save_settings
-from .speech import Speaker
+from .speech import SILERO_VOICE_TITLES, SILERO_VOICES, Speaker
 
 CHECK_ON = "Да"
 CHECK_OFF = "—"
+LEAD_ONE = "К доске выходит"
+LEAD_MANY = "К доске выходят"
 UI_FONT = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
 
 
@@ -35,9 +38,15 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.settings = load_settings()
-        self.messages: "queue.Queue[str]" = queue.Queue()
-        self.speaker = Speaker(self.messages)
+        self.messages: "queue.Queue" = queue.Queue()
+        self.speaker = Speaker(
+            self.messages,
+            MODELS_DIR,
+            voice=self.settings.get("voice", SILERO_VOICES[0]),
+            use_silero=bool(self.settings.get("use_silero", True)),
+        )
         self.lesson = Lesson([])
+        self.spoken: dict = {}  # ФИО -> текст для озвучки (с ударениями «+»)
         self.dirty = False
         self._suppress_task_trace = False
 
@@ -149,6 +158,18 @@ class App:
         self.speak_var = tk.BooleanVar(value=bool(self.settings.get("speak", True)))
         ttk.Checkbutton(row, text="Озвучивать ФИО", variable=self.speak_var).pack(side=tk.LEFT, padx=(12, 0))
 
+        vrow = ttk.Frame(call)
+        vrow.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(vrow, text="Голос Silero:").pack(side=tk.LEFT)
+        self.voice_var = tk.StringVar()
+        self.voice_box = ttk.Combobox(vrow, textvariable=self.voice_var, state="disabled", width=16)
+        self.voice_box.pack(side=tk.LEFT, padx=6)
+        self.voice_box.bind("<<ComboboxSelected>>", self._on_voice_selected)
+        self.engine_var = tk.StringVar(value="загрузка…")
+        ttk.Label(vrow, textvariable=self.engine_var, style="Info.TLabel").pack(side=tk.LEFT, padx=(6, 0))
+        self._voice_ids: list = []
+        self._set_voices(list(SILERO_VOICES), enabled=False)
+
         ttk.Button(call, text="Вызвать  (F5)", style="Call.TButton", command=self.on_call).pack(fill=tk.X, pady=(8, 4))
         ttk.Button(call, text="Повторить озвучку", command=self.on_repeat).pack(anchor=tk.E)
 
@@ -257,14 +278,45 @@ class App:
     def _poll_messages(self) -> None:
         try:
             while True:
-                self._set_status(self.messages.get_nowait())
+                item = self.messages.get_nowait()
+                if isinstance(item, tuple) and item and item[0] == "voices":
+                    self._set_voices(item[1], enabled=True)
+                else:
+                    self._set_status(str(item))
         except queue.Empty:
             pass
+        if self.speaker.silero_ready:
+            engine = "Silero готов"
+        elif self.speaker.silero_error is None:
+            engine = "Silero загружается…"
+        else:
+            engine = "Silero недоступен — голос Windows"
+        self.engine_var.set(engine)
         self.root.after(250, self._poll_messages)
+
+    # ------------------------------------------------------------ голос
+    def _set_voices(self, voices, enabled: bool) -> None:
+        self._voice_ids = list(voices)
+        self.voice_box["values"] = [SILERO_VOICE_TITLES.get(v, v) for v in voices]
+        current = self.speaker.voice if self.speaker.voice in voices else voices[0]
+        self.voice_var.set(SILERO_VOICE_TITLES.get(current, current))
+        self.voice_box.configure(state="readonly" if enabled else "disabled")
+
+    def _on_voice_selected(self, _event=None) -> None:
+        idx = self.voice_box.current()
+        if idx < 0:
+            return
+        voice = self._voice_ids[idx]
+        self.speaker.set_voice(voice)
+        self.settings["voice"] = voice
+        if self.speak_var.get():
+            self.speaker.say("Проверка голоса")
 
     # ------------------------------------------------------------ список
     def _load_initial_roster(self) -> None:
         last = self.settings.get("last_roster")
+        if last and _is_results_file(Path(last)):
+            last = None
         for candidate in (last, str(DEFAULT_ROSTER)):
             if candidate and Path(candidate).is_file():
                 self._load_roster_file(Path(candidate), quiet=True)
@@ -273,7 +325,7 @@ class App:
 
     def _load_roster_file(self, path: Path, quiet: bool = False) -> bool:
         try:
-            names, duplicates = load_roster(path)
+            names, duplicates, spoken = load_roster(path)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Ошибка", f"Не удалось прочитать список:\n{path}\n\n{e}", parent=self.root)
             return False
@@ -281,8 +333,14 @@ class App:
             messagebox.showwarning("Пустой список", f"В файле нет ни одного ФИО:\n{path}", parent=self.root)
             return False
         self.lesson = Lesson(names, source=path.name)
+        self.spoken = spoken
         self.dirty = False
-        self.settings["last_roster"] = str(path)
+        if not _is_results_file(path):
+            # файл сохранённой пары не запоминаем — при следующем запуске
+            # откроется обычный список студентов
+            self.settings["last_roster"] = str(path)
+        # Silero заранее озвучивает фразы и все ФИО, чтобы вызов звучал сразу
+        self.speaker.prefetch([LEAD_MANY, LEAD_ONE] + [spoken.get(n, n) for n in names])
         self.roster_var.set(f"Список: {path.name}  ({len(names)} чел.)")
         self._refresh_all()
         self._set_status(f"Загружен список: {path.name}, {len(names)} студентов")
@@ -406,8 +464,8 @@ class App:
         rec = self.lesson.current_call
         if rec is None or not self.speak_var.get():
             return
-        lead = "К доске выходит" if len(rec.students) == 1 else "К доске выходят"
-        self.speaker.say(f"{lead}: " + ". ".join(rec.students) + ".")
+        lead = LEAD_ONE if len(rec.students) == 1 else LEAD_MANY
+        self.speaker.say(lead, [self.spoken.get(n, n) for n in rec.students])
 
     def on_repeat(self) -> None:
         if self.lesson.current_call is None:
@@ -465,6 +523,7 @@ class App:
             return
         self.settings["call_count"] = self._get_count() or DEFAULT_CALL_COUNT
         self.settings["speak"] = bool(self.speak_var.get())
+        self.settings["voice"] = self.speaker.voice
         if self.root.state() == "normal":
             self.settings["geometry"] = self.root.geometry()
         save_settings(self.settings)
@@ -479,6 +538,14 @@ class App:
         except OSError:
             pass
         messagebox.showerror("Ошибка", f"{val}\n\nПодробности записаны в {LOG_FILE.name}", parent=self.root)
+
+
+def _is_results_file(path: Path) -> bool:
+    """Файл лежит в папке results (это сохранённая пара, а не список)."""
+    try:
+        return Path(path).resolve().parent == RESULTS_DIR.resolve()
+    except OSError:
+        return False
 
 
 def _enable_dpi_awareness() -> None:

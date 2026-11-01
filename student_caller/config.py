@@ -15,5 +15,6 @@ LATE_MINUTES = 10
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_ROSTER = BASE_DIR / "students.txt"
 RESULTS_DIR = BASE_DIR / "results"
+MODELS_DIR = BASE_DIR / "models"  # сюда скачивается модель Silero
 SETTINGS_FILE = BASE_DIR / "settings.json"
 LOG_FILE = BASE_DIR / "error.log"

@@ -1,6 +1,7 @@
 {
-  "last_roster": "C:\\Users\\Li\\Documents\\Project\\StudentCaller\\students.txt",
+  "last_roster": "C:\\Users\\Li\\Documents\\Project\\students.txt",
   "call_count": 4,
-  "speak": true,
-  "geometry": "1200x720+64+78"
+  "speak": false,
+  "geometry": "1200x720+-2+99",
+  "voice": "eugene"
 }
